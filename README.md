@@ -1,0 +1,105 @@
+# bash_der
+
+An ASN.1 DER/BER encoder and decoder written entirely in Bash.
+
+The text format is [DER ASCII](https://github.com/google/der-ascii), the
+format used by Google's `der2ascii` and `ascii2der` tools. Files produced or
+consumed by these scripts are interchangeable with the upstream Go tools.
+
+- `der2ascii.sh` disassembles DER/BER bytes into DER ASCII text.
+- `ascii2der.sh` assembles DER ASCII text back into bytes.
+
+## Requirements
+
+Bash 4 or later. The scripts only use Bash builtins at runtime; no `xxd`,
+`od`, `base64` or `openssl` is needed.
+
+## Usage
+
+```sh
+# Decode
+./der2ascii.sh -i cert.der            # binary DER/BER
+./der2ascii.sh -pem -i cert.pem       # first PEM block
+./der2ascii.sh -hex -i cert.hex       # hex, ignoring whitespace and punctuation
+openssl x509 -in cert.pem -outform DER | ./der2ascii.sh > cert.txt
+
+# Encode
+./ascii2der.sh -i cert.txt -o cert.der
+./ascii2der.sh -i cert.txt -pem CERTIFICATE
+```
+
+| Script | Option | Meaning |
+| --- | --- | --- |
+| both | `-i FILE` | input file (default: stdin) |
+| both | `-o FILE` | output file (default: stdout) |
+| `der2ascii.sh` | `-hex` | treat the input as hex |
+| `der2ascii.sh` | `-pem` | treat the input as PEM and decode the first block |
+| `ascii2der.sh` | `-pem TYPE` | write the output as a PEM block of this type |
+
+Errors are written to stderr with a line number, and the scripts exit with
+status 1.
+
+## Example
+
+```sh
+$ printf 'SEQUENCE { INTEGER { 5 } OBJECT_IDENTIFIER { 1.2.840.113549.1.1.11 } }' |
+    ./ascii2der.sh | ./der2ascii.sh
+SEQUENCE {
+  INTEGER { 5 }
+  # sha256WithRSAEncryption
+  OBJECT_IDENTIFIER { 1.2.840.113549.1.1.11 }
+}
+```
+
+## Format support
+
+The encoder implements the whole language described in upstream
+[`language.txt`](https://github.com/google/der-ascii/blob/main/language.txt):
+
+- quoted strings, `u"..."` UTF-16 and `U"..."` UTF-32 literals
+- hex (`` `...` ``) and bit string (`` b`...` ``) literals
+- integers (64-bit), OIDs and relative OIDs (64-bit components), `TRUE`/`FALSE`
+- tag expressions (`[APPLICATION 5 PRIMITIVE]`, `[long-form:2 INTEGER]`) and type names
+- length prefixes with `indefinite`, `long-form:N` and `adjust-length:N`
+
+The decoder follows the upstream disassembler's heuristics. It recurses into
+`OCTET STRING`s and `BIT STRING`s that contain DER, prints readable integers,
+OIDs, booleans and strings, keeps BER encodings (indefinite lengths,
+non-minimal tags and lengths) round-trippable, and adds `# name` comments for
+the OIDs upstream knows about.
+
+## Testing
+
+```sh
+tests/run_tests.sh
+```
+
+This assembles each `tests/*.txt` file, disassembles it, reassembles it and
+checks that the bytes match. The same check runs through PEM and hex input.
+
+If the upstream Go tools are available, the script also compares output with
+them and fuzzes the decoder with random and mutated inputs:
+
+```sh
+GOBIN=/tmp/refbin go install github.com/google/der-ascii/cmd/...@main
+REF_BIN=/tmp/refbin tests/run_tests.sh 300   # 300 fuzz iterations
+```
+
+## Limitations
+
+- Deciding which characters in `BMPString` and `UniversalString` values are
+  printable uses an approximation of Go's `unicode.IsPrint`. Rare or unassigned
+  code points may be printed raw where upstream writes an escape. Both forms
+  encode to the same bytes.
+- The upstream `-pem-all`, `-pem-password` and `-array` options are not
+  implemented.
+- Bash is slow. The decoder handles about 40 KB/s and the encoder about
+  55 KB of text per second. That is fine for certificates and keys, but not for
+  multi-megabyte files.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+The OID name table in `der2ascii.sh` comes from der-ascii's `oid_names.go`,
+Copyright The DER ASCII Authors, also licensed under the Apache License 2.0.

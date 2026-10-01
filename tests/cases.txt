@@ -1,0 +1,119 @@
+# Edge cases for the Bash DER ASCII tools.
+
+SEQUENCE {
+  INTEGER { 0 }
+  INTEGER { -1 }
+  INTEGER { 127 }
+  INTEGER { 128 }
+  INTEGER { -128 }
+  INTEGER { -129 }
+  INTEGER { 100000 }
+  INTEGER { 100001 }
+  INTEGER { -100000 }
+  INTEGER { -100001 }
+  INTEGER { 9223372036854775807 }
+  INTEGER { -9223372036854775808 }
+  INTEGER { 007 }
+  INTEGER { `0001` }
+  INTEGER { `ff80` }
+  INTEGER { `` }
+  ENUMERATED { 3 }
+}
+
+SEQUENCE {
+  OBJECT_IDENTIFIER { 1.2.840.113549.1.1.11 }
+  OBJECT_IDENTIFIER { 2.5.4.3 }
+  OBJECT_IDENTIFIER { 2.999.3 }
+  OBJECT_IDENTIFIER { 0.39 }
+  OBJECT_IDENTIFIER { 1.2.18446744073709551615 }
+  OBJECT_IDENTIFIER { 2.18446744073709551535 }
+  OBJECT_IDENTIFIER { 1.2.9223372036854775808 }
+  OBJECT_IDENTIFIER { `2a80` }
+  OBJECT_IDENTIFIER { `808001` }
+  OBJECT_IDENTIFIER { `ffffffffffffffffff7f` }
+  OBJECT_IDENTIFIER { `0001ffffffffffffffff7f` }
+  RELATIVE_OID { .4.1.72585 }
+  RELATIVE_OID { .0 }
+  RELATIVE_OID { .18446744073709551615 }
+}
+
+SEQUENCE {
+  BOOLEAN { TRUE }
+  BOOLEAN { FALSE }
+  BOOLEAN { `01` }
+  NULL {}
+  BIT_STRING { b`` }
+  BIT_STRING { b`1` }
+  BIT_STRING { b`10101010` }
+  BIT_STRING { b`1010` }
+  BIT_STRING { b`1010|1010` }
+  BIT_STRING { b`1010|0001` }
+  BIT_STRING { b`101010101010101010101010101` }
+  BIT_STRING { b`10101010101010101010101010101010` }
+  BIT_STRING { `00` `aabbccddee` }
+  BIT_STRING { `03` `aabbccddee` }
+  BIT_STRING { `08` `aa` }
+  BIT_STRING { `00` SEQUENCE { INTEGER { 1 } } }
+  BIT_STRING { `00` "hello world, this is text" }
+}
+
+SEQUENCE {
+  UTF8String { "hello \"world\" \\ \n tab\x09 high\xff" }
+  UTF8String { "caf\xc3\xa9" }
+  PrintableString { "x" }
+  OCTET_STRING { `000102030405` }
+  OCTET_STRING { "mostly text with one byte \x01" }
+  OCTET_STRING { SEQUENCE { INTEGER { 5 } } }
+  OCTET_STRING { `0000` }
+  BMPString { u"hi é 😀 \n \" \\" }
+  BMPString { u"\ud83d" }
+  BMPString { u"\udc00\ud83d" }
+  BMPString { u"\u00ad\u200b\u3000" }
+  BMPString { u"\U0001f600\U0010ffff\U00110000" }
+  BMPString { u"odd" `aa` }
+  UniversalString { U"hi é 😀 \n \" \\" }
+  UniversalString { U"\U00110000\U0000d800\x00\u0123" }
+  UniversalString { U"x" `aabbcc` }
+  UniversalString { U"\Uffffffff" }
+  UniversalString { `` }
+  UTF8String { "\Uffffffff" }
+}
+
+# Tags.
+[0] { INTEGER { 1 } }
+[0 PRIMITIVE] { 1 }
+[APPLICATION 5] { }
+[PRIVATE 7 PRIMITIVE] { "x" }
+[UNIVERSAL 0 PRIMITIVE] { }
+[UNIVERSAL 15] { }
+[30] { }
+[31] { }
+[32 PRIMITIVE] { "a" }
+[4294967295] { }
+[long-form:1 SEQUENCE] { }
+[long-form:2 UNIVERSAL 2 PRIMITIVE] { 5 }
+[long-form:3 APPLICATION 200] { }
+[SEQUENCE PRIMITIVE] { `01` }
+[OCTET_STRING CONSTRUCTED] { OCTET_STRING { "hello " } OCTET_STRING { "world" } }
+[INTEGER] { 1 }
+TIME-OF-DAY { "12:00:00" }
+`1f80801f00`
+`3f8000`
+
+# Lengths.
+INTEGER long-form:1 { 5 }
+INTEGER long-form:3 { 5 }
+INTEGER adjust-length:1 { 5 }
+INTEGER adjust-length:+1 { 5 }
+INTEGER adjust-length:-1 { 5 }
+INTEGER long-form:1 adjust-length:1 { 5 }
+OCTET_STRING { "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789" }
+OCTET_STRING long-form:2 { "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789" }
+SEQUENCE indefinite {
+  INTEGER { 1 }
+  SET indefinite { INTEGER { 2 } }
+  [0] indefinite { }
+}
+SEQUENCE `80`
+  INTEGER { 1 }
+  INTEGER { 2 }
