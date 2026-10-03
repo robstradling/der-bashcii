@@ -273,46 +273,73 @@ done
 # Bash substring access is O(length), so input bytes live in an array.
 declare -a B # input bytes as decimal values
 NB=0         # number of input bytes
+# The input is also kept as "hh " triples in chunks of HCH bytes, so ranges can
+# be extracted and classified with string operations instead of per-byte loops.
+declare -a HXC
+HCH=1024
+HACC=""
 declare -a OUTL # output lines
 NO=0            # number of output lines
 S=""            # string return register
+X=""            # spaced hex return register
 Q=""            # string builder for quoted output
+declare -a PAD  # indentation strings by depth
+declare -A TAGS # tag_to_string cache
+declare -A OIDS # oid_to_string cache keyed by hex
 
 # ---------------------------------------------------------------------------
 # Input handling
 
+# printf arguments that convert the characters (ORDARGS) or hex digit pairs
+# (HEXARGS) of $piece to numbers in one call. All entries have the same width,
+# so a prefix covers the first N characters or pairs.
+printf -v ORDARGS '"'"'"'${piece:%5d:1}" ' {0..1023}
+printf -v HEXARGS '0x${piece:%5d:2} ' {0..2046..2}
+ORDW=$((${#ORDARGS} / 1024))
+HEXW=$((${#HEXARGS} / 1024))
+
+# add_bytes DECIMALS...: appends bytes to B and HXC.
+add_bytes() {
+	local h
+	(($#)) || return 0
+	B+=("$@")
+	((NB += $#))
+	printf -v h '%02x ' "$@"
+	HACC+=$h
+	while ((${#HACC} >= 3 * HCH)); do
+		HXC+=("${HACC:0:3*HCH}")
+		HACC=${HACC:3*HCH}
+	done
+}
+
 # Reads stdin as binary into B. With -d '' a NUL ends a read early, so a short
 # successful read means a NUL byte was consumed.
 read_binary() {
-	local piece i m v st
+	local piece m v st
 	while :; do
-		if IFS= read -r -d '' -n 256 piece; then st=0; else st=1; fi
+		if IFS= read -r -d '' -n 1024 piece; then st=0; else st=1; fi
 		m=${#piece}
-		for ((i = 0; i < m; i++)); do
-			printf -v v '%d' "'${piece:i:1}"
-			B[NB++]=$((v & 255))
-		done
+		v=""
+		((m)) && eval "printf -v v '%d ' ${ORDARGS:0:m*ORDW}"
+		((st == 0 && m < 1024)) && v+=0
+		add_bytes $v
 		((st)) && break
-		((m < 256)) && B[NB++]=0
 	done
+	HXC+=("$HACC")
 }
 
 # Reads stdin as hex into B, ignoring whitespace and punctuation.
 read_hex() {
-	local text blk piece o j k n
+	local text piece o v
 	IFS= read -r -d '' text || true
 	text=${text//[[:space:][:punct:]]/}
 	[[ $text =~ ^([0-9a-fA-F][0-9a-fA-F])*$ ]] || die "invalid hex input"
-	n=${#text}
-	for ((o = 0; o < n; o += 65536)); do
-		blk=${text:o:65536}
-		for ((j = 0; j < ${#blk}; j += 512)); do
-			piece=${blk:j:512}
-			for ((k = 0; k < ${#piece}; k += 2)); do
-				B[NB++]=$((16#${piece:k:2}))
-			done
-		done
+	for ((o = 0; o < ${#text}; o += 2048)); do
+		piece=${text:o:2048}
+		eval "printf -v v '%d ' ${HEXARGS:0:${#piece}/2*HEXW}"
+		add_bytes $v
 	done
+	HXC+=("$HACC")
 }
 
 B64=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
@@ -322,6 +349,7 @@ for ((i = 0; i < 64; i++)); do B64V[${B64:i:1}]=$i; done
 # Decodes the first PEM block of stdin into B.
 read_pem() {
 	local line state=0 b64="" blk piece o j k n v rest=""
+	local -a out
 	while IFS= read -r line || [[ -n $line ]]; do
 		line=${line%$'\r'}
 		if ((state == 0)); then
@@ -343,39 +371,43 @@ read_pem() {
 		blk=${b64:o:65536}
 		for ((j = 0; j < ${#blk}; j += 512)); do
 			piece=${blk:j:512}
+			out=()
 			for ((k = 0; k + 4 <= ${#piece}; k += 4)); do
 				v=$((B64V[${piece:k:1}] << 18 | B64V[${piece:k+1:1}] << 12 |
 					B64V[${piece:k+2:1}] << 6 | B64V[${piece:k+3:1}]))
-				B[NB++]=$((v >> 16))
-				B[NB++]=$((v >> 8 & 255))
-				B[NB++]=$((v & 255))
+				out+=($((v >> 16)) $((v >> 8 & 255)) $((v & 255)))
 			done
+			((${#out[@]} == 0)) || add_bytes "${out[@]}"
 			rest=${piece:k}
 		done
 	done
 	if ((${#rest} == 2)); then
-		B[NB++]=$((B64V[${rest:0:1}] << 2 | B64V[${rest:1:1}] >> 4))
+		add_bytes $((B64V[${rest:0:1}] << 2 | B64V[${rest:1:1}] >> 4))
 	elif ((${#rest} == 3)); then
 		v=$((B64V[${rest:0:1}] << 10 | B64V[${rest:1:1}] << 4 | B64V[${rest:2:1}] >> 2))
-		B[NB++]=$((v >> 8))
-		B[NB++]=$((v & 255))
+		add_bytes $((v >> 8)) $((v & 255))
 	fi
+	HXC+=("$HACC")
 }
 
 # ---------------------------------------------------------------------------
 # BER parsing. Positions are indices into B.
 
+# spaced_range START END -> X ("hh hh ... ")
+spaced_range() {
+	local c=$(($1 / HCH)) o=$(($1 % HCH * 3)) n=$((($2 - $1) * 3)) piece
+	X=""
+	while ((n > 0)); do
+		piece=${HXC[c++]:o:n}
+		X+=$piece
+		((n -= ${#piece}, o = 0))
+	done
+}
+
 # hex_range START END -> S
-# (Slicing "${B[@]:s:n}" walks the array from its head, so copy element-wise.)
 hex_range() {
-	local i
-	local -a v=()
-	for ((i = $1; i < $2; i++)); do v+=("${B[i]}"); done
-	if ((${#v[@]})); then
-		printf -v S '%02x' "${v[@]}"
-	else
-		S=""
-	fi
+	spaced_range "$1" "$2"
+	S=${X// /}
 }
 
 # parse_tag POS END -> T_CLASS T_NUM T_CONS T_LFO T_NEXT
@@ -412,18 +444,24 @@ parse_tag() {
 # parse_element POS END -> E_CLASS E_NUM E_CONS E_TLFO E_INDEF E_LLFO E_BS E_BE E_NEXT
 # An EOC parses as a primitive universal 0 element; callers must check for it.
 parse_element() {
-	local p end=$2 b n i len=0
-	parse_tag "$1" "$end" || return 1
-	p=$T_NEXT
+	local p=$1 end=$2 b n i len=0
+	((p < end)) || return 1
+	b=${B[p]}
+	if (((b & 0x1f) != 0x1f)); then
+		((E_CLASS = b & 0xc0, E_CONS = (b & 0x20) != 0, E_NUM = b & 0x1f, E_TLFO = 0, p++))
+	else
+		parse_tag "$p" "$end" || return 1
+		E_CLASS=$T_CLASS E_NUM=$T_NUM E_CONS=$T_CONS E_TLFO=$T_LFO p=$T_NEXT
+	fi
 	((p < end)) || return 1
 	b=${B[p++]}
-	E_INDEF=0
-	E_LLFO=0
+	E_INDEF=0 E_LLFO=0
 	if ((b < 0x80)); then
 		len=$b
 	elif ((b == 0x80)); then
-		((T_CONS)) || return 1
-		E_INDEF=1
+		((E_CONS)) || return 1
+		((E_INDEF = 1, E_BS = E_BE = E_NEXT = p))
+		return 0
 	else
 		n=$((b & 0x7f))
 		((n <= end - p)) || return 1
@@ -434,19 +472,8 @@ parse_element() {
 		((B[p] == 0 || len < 0x80)) && E_LLFO=$n
 		((p += n))
 	fi
-	if ((E_INDEF)); then
-		E_BS=$p
-		E_BE=$p
-	else
-		((len <= end - p)) || return 1
-		E_BS=$p
-		E_BE=$((p + len))
-	fi
-	E_NEXT=$E_BE
-	E_CLASS=$T_CLASS
-	E_NUM=$T_NUM
-	E_CONS=$T_CONS
-	E_TLFO=$T_LFO
+	((len <= end - p)) || return 1
+	((E_BS = p, E_BE = E_NEXT = p + len))
 }
 
 # starts_with_eoc POS END
@@ -473,19 +500,26 @@ is_made_of_elements() {
 # ---------------------------------------------------------------------------
 # Formatting
 
+# add_line INDENT TEXT
 add_line() {
-	set_line $((NO++)) "$1" "$2"
+	[[ -n ${PAD[$1]+x} ]] || printf -v "PAD[$1]" '%*s' $(($1 * 2)) ''
+	OUTL[NO++]=${PAD[$1]}$2
 }
 
 # set_line INDEX INDENT TEXT
 set_line() {
-	local pad
-	printf -v pad '%*s' $(($2 * 2)) ''
-	OUTL[$1]=$pad$3
+	OUTL[$1]=${PAD[$2]}$3
 }
 
 # tag_to_string CLASS NUM CONS LFO -> S
 tag_to_string() {
+	S=${TAGS[$1,$2,$3,$4]-}
+	[[ -n $S ]] && return
+	make_tag_string "$@"
+	TAGS[$1,$2,$3,$4]=$S
+}
+
+make_tag_string() {
 	local class=$1 num=$2 cons=$3 lfo=$4 name="" inc=0 ok=0
 	if ((class == 0)) && [[ -n ${UNAME[num]-} ]]; then
 		ok=1
@@ -516,25 +550,38 @@ tag_to_string() {
 
 # bytes_to_string START END -> S (quoted string if mostly printable, else hex)
 bytes_to_string() {
-	local s=$1 e=$2 i b ascii=0 n=$(($2 - $1))
+	local n=$(($2 - $1)) t
 	if ((n == 0)); then
 		S=""
 		return
 	fi
-	for ((i = s; i < e; i++)); do
-		b=${B[i]}
-		((b == 10 || (b >= 32 && b < 127))) && ((ascii++))
-	done
-	if ((ascii * 20 > n * 17)); then
-		bytes_to_quoted "$s" "$e"
+	spaced_range "$1" "$2"
+	# Delete the printable bytes and count what is left.
+	t=${X//[2-6]? /}
+	t=${t//7[0-9a-e] /}
+	t=${t//0a /}
+	if (((n - ${#t} / 3) * 20 > n * 17)); then
+		bytes_to_quoted "$1" "$2"
 	else
-		hex_range "$s" "$e"
-		S="\`$S\`"
+		S="\`${X// /}\`"
 	fi
 }
 
+# bytes_to_quoted START END -> S. X must hold spaced_range START END.
 bytes_to_quoted() {
-	local i b q='"' f
+	local i b q='"' f t
+	local -a hx
+	# Fast path: printable bytes other than '"' and '\' need no escaping.
+	t=${X//[346]? /}
+	t=${t//2[013-9a-f] /}
+	t=${t//5[0-9abd-f] /}
+	t=${t//7[0-9a-e] /}
+	if [[ -z $t ]]; then
+		hx=($X)
+		printf -v f '\\x%s' "${hx[@]}"
+		printf -v S '"%b"' "$f"
+		return
+	fi
 	for ((i = $1; i < $2; i++)); do
 		b=${B[i]}
 		if ((b == 10)); then
@@ -755,7 +802,7 @@ bit_string_literal() {
 # unconsumed position (END unless stopped at an EOC).
 der_to_ascii() {
 	local p=$1 end=$2 ind=$3 stop=$4
-	local class num cons tlfo indef llfo bs be tag header slot name b0 n first
+	local class num cons tlfo indef llfo bs be tag header slot name b0 n first key
 	while ((p < end)); do
 		if ((stop)) && starts_with_eoc "$p" "$end"; then
 			R_POS=$p
@@ -767,9 +814,8 @@ der_to_ascii() {
 			R_POS=$end
 			return
 		fi
-		class=$E_CLASS num=$E_NUM cons=$E_CONS tlfo=$E_TLFO
-		indef=$E_INDEF llfo=$E_LLFO bs=$E_BS be=$E_BE
-		p=$E_NEXT
+		class=$E_CLASS num=$E_NUM cons=$E_CONS tlfo=$E_TLFO \
+			indef=$E_INDEF llfo=$E_LLFO bs=$E_BS be=$E_BE p=$E_NEXT
 		tag_to_string "$class" "$num" "$cons" "$tlfo"
 		tag=$S
 
@@ -813,9 +859,14 @@ der_to_ascii() {
 			;;
 		OBJECT_IDENTIFIER)
 			hex_range "$bs" "$be"
-			S=${OIDNAME[$S]-}
+			key=$S
+			S=${OIDNAME[$key]-}
 			[[ -n $S ]] && add_line "$ind" "# $S"
-			oid_to_string "$bs" "$be"
+			S=${OIDS[$key]-}
+			if [[ -z $S ]]; then
+				oid_to_string "$bs" "$be"
+				OIDS[$key]=$S
+			fi
 			add_line "$ind" "$header $S }"
 			;;
 		RELATIVE_OID)

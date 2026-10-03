@@ -6,7 +6,11 @@
 # Usage: ascii2der.sh [-i in] [-o out] [-pem TYPE]
 
 set -u
+set -f
 shopt -s extglob
+# Bash 5.2+ can splice each match into a substitution with &.
+AMP=0
+shopt -s patsub_replacement 2>/dev/null && AMP=1
 export LC_ALL=C
 
 usage() {
@@ -24,11 +28,14 @@ die() {
 	exit 1
 }
 
-# die_at POS MSG: reports an error at the line containing byte offset POS.
+# die_at POS MSG: reports an error at the line containing byte offset POS. POS
+# may also be OFFSET:N, meaning N lines after that one.
 die_at() {
-	local pre=${TXT:0:$1} nl
+	local pos=${1%:*} extra=0 pre nl
+	[[ $1 == *:* ]] && extra=${1#*:}
+	pre=${TXT:0:pos}
 	nl=${pre//[!$'\n']/}
-	die "line $((${#nl} + 1)): $2"
+	die "line $((${#nl} + extra + 1)): $2"
 }
 
 # Universal tag aliases: UNUM[name]=number, UCONS[name]=default constructed bit.
@@ -87,9 +94,39 @@ WIN=""
 WB=0
 WLEN=0
 WSIZE=4096
+# The fast tokenizer matches TOKRE against TW, a copy of TXT starting at P.
+TW=""
+TWB=0
+NL=$'\n'
+TOKRE='^(['"$WS"']|#[^'"$NL"']*'"$NL"')*([{}]|[uU]?"([^"\\]|\\.)*"|b?`[^`]*`|\[[^]]*]|[^'"$SYMDELIM"']+)'
+# Characters that end a run of plain words; ']' must come first.
+SEGSTOP=']"`[#'
+WQ=()         # queued words
+WI=0          # index of the next queued word
+NWQ=0         # number of queued words
+SEGP=0        # position of the queued words, for error messages
+SEGL=0        # newlines passed since SEGP
+declare -A SYMV # bare symbol -> encoding
+declare -A TAGV # bracketed tag -> encoding
 S=""    # string return register
 ERR=""  # error message register
 h=""
+
+# printf arguments that convert the characters of $piece to numbers in one
+# call. All entries have the same width, so a prefix covers N characters.
+printf -v ORDARGS '"'"'"'${piece:%5d:1}" ' {0..255}
+ORDW=$((${#ORDARGS} / 256))
+
+# chars_to_hex STR FORMAT -> V (FORMAT applied to each character's code)
+chars_to_hex() {
+	local s=$1 piece o
+	V=""
+	for ((o = 0; o < ${#s}; o += 256)); do
+		piece=${s:o:256}
+		eval "printf -v h '$2' ${ORDARGS:0:${#piece}*ORDW}"
+		V+=$h
+	done
+}
 
 # ---------------------------------------------------------------------------
 # Integer helpers. uint64 values are stored in bash's signed 64-bit integers.
@@ -139,13 +176,13 @@ parse_int64() {
 
 # append_base128 VALUE LENGTH_OVERRIDE -> S
 append_base128() {
-	local v=$1 len=$2 l=0 n=$1 i b
-	while ((n != 0)); do
-		lshr "$n" 7
-		n=$LS
-		((l++))
-	done
-	((v == 0)) && l=1
+	local v=$1 len=$2 l=1 n i
+	local -a out=()
+	if ((v < 0)); then
+		l=10
+	else
+		for ((n = v >> 7; n; n >>= 7)); do ((l++)); done
+	fi
 	if ((len)); then
 		if ((len < l)); then
 			ERR="length override of $len is too small, need at least $l bytes"
@@ -153,14 +190,17 @@ append_base128() {
 		fi
 		l=$len
 	fi
-	S=""
-	for ((i = l; i > 0; i--)); do
-		lshr "$v" $((7 * (i - 1)))
-		b=$((LS & 0x7f))
-		((i > 1)) && ((b |= 0x80))
-		printf -v h '%02x' "$b"
-		S+=$h
+	for ((i = l - 1; i >= 0; i--)); do
+		if ((7 * i >= 64)); then
+			LS=0
+		elif ((v >= 0)); then
+			LS=$((v >> 7 * i))
+		else
+			lshr "$v" $((7 * i))
+		fi
+		out+=($((LS & 0x7f | (i ? 0x80 : 0))))
 	done
+	printf -v S '%02x' "${out[@]}"
 }
 
 # append_tag CLASS NUMBER CONSTRUCTED LONG_FORM_OVERRIDE -> S
@@ -523,11 +563,9 @@ decode_tag_string() {
 	V=$S
 }
 
-# next_token -> K (kind), V (hex value for bytes), L (length modifier), TP (position)
-# Kinds: bytes '{' '}' indefinite long-form adjust-length eof
-next_token() {
+# slow_next_token: next_token for any input, scanning character by character.
+slow_next_token() {
 	local c start sym n rest
-	local -a parts
 	skip_space
 	TP=$P
 	if ((P >= TLEN)); then
@@ -591,7 +629,139 @@ next_token() {
 		((P += ${#C}))
 		((${#C} < ${#rest})) && break
 	done
+	classify_symbol "$sym" "$start"
+}
 
+# sync_window: makes TW start at P.
+sync_window() {
+	local n=$((P - TWB))
+	if ((n)); then
+		if ((n > 0 && n < ${#TW})); then TW=${TW:n}; else TW=${TXT:P:WSIZE}; fi
+		TWB=$P
+	fi
+	((${#TW} < 512 && P + ${#TW} < TLEN)) && TW=${TXT:P:WSIZE}
+}
+
+# fill_queue: queues the whitespace-separated words before the next character
+# that needs the regex tokenizer. Newlines are queued as '#' words, which can't
+# otherwise occur. Fails if there are no words.
+fill_queue() {
+	local ws seg oifs
+	sync_window
+	ws=${TW%%[!$WS]*}
+	if [[ -n $ws ]]; then
+		((P += ${#ws}))
+		TW=${TW:${#ws}} TWB=$P
+	fi
+	seg=${TW%%[$SEGSTOP]*}
+	# Leave a word that may be cut off by the window, or that may be the u, U
+	# or b prefix of a string, to the regex tokenizer.
+	if { ((${#seg} == ${#TW} && P + ${#TW} < TLEN)) || [[ ${TW:${#seg}:1} == [\"\`] ]]; } &&
+		[[ $seg != *[$WS] ]]; then
+		[[ $seg == *[$WS]* ]] || return 1
+		seg=${seg%[$WS]*}
+	fi
+	[[ -n $seg ]] || return 1
+	((P += ${#seg}))
+	[[ $seg == *$NL* ]] && seg=${seg//$NL/ # }
+	seg=${seg//\{/ \{ }
+	seg=${seg//\}/ \} }
+	oifs=$IFS IFS=$WS
+	WQ=($seg)
+	IFS=$oifs
+	WI=0 NWQ=${#WQ[@]} SEGP=$TWB SEGL=0
+}
+
+# next_token -> K (kind), V (hex value for bytes), L (length modifier), TP (position)
+# Kinds: bytes '{' '}' indefinite long-form adjust-length eof
+# Runs of plain words are split in bulk by fill_queue. Other common tokens are
+# matched with one regex, and anything else (escapes, bit strings, errors,
+# EOF) is left to slow_next_token.
+next_token() {
+	local tok body n size=$WSIZE
+	while ((WI < NWQ)) || fill_queue; do
+		tok=${WQ[WI++]}
+		# The word is SEGL lines after the one holding SEGP.
+		case $tok in
+		'#')
+			((SEGL++))
+			continue
+			;;
+		'{' | '}')
+			K=$tok TP=$SEGP:$SEGL
+			return
+			;;
+		esac
+		TP=$SEGP:$SEGL K=bytes
+		V=${SYMV[$tok]-}
+		if [[ -z $V ]]; then
+			classify_symbol "$tok" "$TP"
+			[[ $K == bytes ]] && SYMV[$tok]=$V
+		fi
+		return
+	done
+	sync_window
+	# A match that reaches the end of the window may be cut short.
+	until [[ $TW =~ $TOKRE ]] && ((${#BASH_REMATCH[0]} < ${#TW} || P + ${#TW} >= TLEN)); do
+		if ((P + ${#TW} >= TLEN)); then
+			slow_next_token
+			return
+		fi
+		((size *= 2))
+		TW=${TXT:P:size}
+	done
+	tok=${BASH_REMATCH[2]}
+	n=${#BASH_REMATCH[0]}
+	TP=$((P + n - ${#tok}))
+	K=bytes
+	case $tok in
+	'{' | '}')
+		K=$tok
+		;;
+	\"*)
+		[[ $tok == *\\* ]] && { P=$TP; slow_next_token; return; }
+		chars_to_hex "${tok:1:${#tok}-2}" '%02x'
+		;;
+	u\"* | U\"*)
+		body=${tok:2:${#tok}-3}
+		[[ $body == *[!\ -~]* || $body == *\\* ]] && { P=$TP; slow_next_token; return; }
+		if [[ $tok == u* ]]; then chars_to_hex "$body" '%04x'; else chars_to_hex "$body" '%08x'; fi
+		;;
+	b\`*)
+		P=$TP
+		slow_next_token
+		return
+		;;
+	\`*)
+		body=${tok:1:${#tok}-2}
+		[[ $body =~ ^([0-9a-fA-F][0-9a-fA-F])*$ ]] || die_at "$TP" "invalid hex literal"
+		V=${body,,}
+		;;
+	\[*)
+		body=${tok:1:${#tok}-2}
+		[[ -z $body ]] && { P=$TP; slow_next_token; return; }
+		V=${TAGV[$body]-}
+		if [[ -z $V ]]; then
+			decode_tag_string "$body" || die_at "$TP" "$ERR"
+			TAGV[$body]=$V
+		fi
+		;;
+	*)
+		V=${SYMV[$tok]-}
+		if [[ -z $V ]]; then
+			classify_symbol "$tok" "$TP"
+			[[ $K == bytes ]] && SYMV[$tok]=$V
+		fi
+		;;
+	esac
+	((P += n))
+}
+
+# classify_symbol SYM START -> K, V, L
+classify_symbol() {
+	local sym=$1 start=$2 n oifs
+	local -a parts
+	K=bytes
 	if [[ -n ${UNUM[$sym]-} ]]; then
 		append_tag 0 "${UNUM[$sym]}" "${UCONS[$sym]}" 0
 		V=$S
@@ -600,7 +770,9 @@ next_token() {
 		append_integer "$U"
 		V=$S
 	elif [[ $sym =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
-		IFS=. read -ra parts <<<"$sym"
+		oifs=$IFS IFS=.
+		parts=($sym)
+		IFS=$oifs
 		for ((n = 0; n < ${#parts[@]}; n++)); do
 			parse_uint "${parts[n]}" 18446744073709551615 || die_at "$start" "OID component out of range: $sym"
 			parts[n]=$U
@@ -608,7 +780,9 @@ next_token() {
 		append_oid "${parts[@]}" || die_at "$start" "invalid OID: $sym"
 		V=$S
 	elif [[ $sym =~ ^(\.[0-9]+)+$ ]]; then
-		IFS=. read -ra parts <<<"${sym:1}"
+		oifs=$IFS IFS=.
+		parts=(${sym:1})
+		IFS=$oifs
 		V=""
 		for ((n = 0; n < ${#parts[@]}; n++)); do
 			parse_uint "${parts[n]}" 18446744073709551615 || die_at "$start" "OID component out of range: $sym"
@@ -646,14 +820,17 @@ encode_seq() {
 		next_token
 		case $K in
 		bytes | eof)
-			[[ -n $lm ]] && die_at "$lmpos" "$lm token must modify '{'"
-			[[ -n $adj ]] && die_at "$adjpos" "adjust-length token must modify '{'"
-			if [[ $K == eof ]]; then
-				((nested)) && die_at "$open" "unmatched '{'"
-				printf -v R_HEX '%s' "${parts[@]}"
-				return
+			if [[ -n $lm$adj ]]; then
+				[[ -n $lm ]] && die_at "$lmpos" "$lm token must modify '{'"
+				die_at "$adjpos" "adjust-length token must modify '{'"
 			fi
-			parts+=("$V")
+			if [[ $K == bytes ]]; then
+				parts+=("$V")
+				continue
+			fi
+			((nested)) && die_at "$open" "unmatched '{'"
+			printf -v R_HEX '%s' "${parts[@]}"
+			return
 			;;
 		'{')
 			tpos=$TP
@@ -713,10 +890,14 @@ write_binary() {
 		blk=${hex:o:65536}
 		for ((j = 0; j < ${#blk}; j += 4096)); do
 			piece=${blk:j:4096}
-			fmt=""
-			for ((k = 0; k < ${#piece}; k += 2)); do
-				fmt+="\\x${piece:k:2}"
-			done
+			if ((AMP)); then
+				fmt=${piece//??/\\x&}
+			else
+				fmt=""
+				for ((k = 0; k < ${#piece}; k += 2)); do
+					fmt+="\\x${piece:k:2}"
+				done
+			fi
 			printf "$fmt"
 		done
 	done
